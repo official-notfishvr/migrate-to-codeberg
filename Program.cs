@@ -22,6 +22,9 @@ namespace MigrateToCodeberg
             Console.WriteLine("    ----------------------------------------------");
             Console.WriteLine("");
 
+            Console.Write("    Remove push mirrors only (skip migration)? (y/n, default n): ");
+            bool removeMirrorsOnly = Console.ReadLine()?.Trim().ToLower() == "y";
+
             Config config = LoadConfig();
 
             if (config == null)
@@ -51,7 +54,7 @@ namespace MigrateToCodeberg
             try
             {
                 Console.WriteLine("\n>>> Fetching user profile and repository list...");
-                
+
                 var userRequest = new HttpRequestMessage(HttpMethod.Get, "https://api.github.com/user");
                 userRequest.Headers.Authorization = githubAuth;
                 var userResponse = await httpClient.SendAsync(userRequest);
@@ -59,7 +62,7 @@ namespace MigrateToCodeberg
                 var userContent = await userResponse.Content.ReadAsStringAsync();
                 using var userDoc = JsonDocument.Parse(userContent);
                 var userRoot = userDoc.RootElement;
-                
+
                 userLogin = userRoot.GetProperty("login").GetString();
 
                 int page = 1;
@@ -68,18 +71,21 @@ namespace MigrateToCodeberg
                     var uri = $"https://api.github.com/user/repos?per_page=100&page={page}";
                     var request = new HttpRequestMessage(HttpMethod.Get, uri);
                     request.Headers.Authorization = githubAuth;
-                    
+
                     var response = await httpClient.SendAsync(request);
-                    if (!response.IsSuccessStatusCode) break;
+                    if (!response.IsSuccessStatusCode)
+                        break;
 
                     var content = await response.Content.ReadAsStringAsync();
                     var pageRepos = JsonSerializer.Deserialize<List<GithubRepo>>(content, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-                    
-                    if (pageRepos == null || pageRepos.Count == 0) break;
-                    
+
+                    if (pageRepos == null || pageRepos.Count == 0)
+                        break;
+
                     allRepos.AddRange(pageRepos);
-                    
-                    if (pageRepos.Count < 100) break;
+
+                    if (pageRepos.Count < 100)
+                        break;
                     page++;
                 }
 
@@ -93,14 +99,14 @@ namespace MigrateToCodeberg
             }
 
             var uniqueOwners = allRepos.Select(r => r.Owner?.Login).Where(l => !string.IsNullOrEmpty(l)).Distinct().ToList();
-            
+
             var potentialOwners = new List<string>();
             if (uniqueOwners.Contains(userLogin))
             {
                 potentialOwners.Add(userLogin);
                 uniqueOwners.Remove(userLogin);
             }
-            
+
             var orgsLogins = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             try
             {
@@ -113,7 +119,8 @@ namespace MigrateToCodeberg
                     var orgs = JsonSerializer.Deserialize<List<GithubOrg>>(orgsContent);
                     if (orgs != null)
                     {
-                        foreach (var org in orgs) orgsLogins.Add(org.Login);
+                        foreach (var org in orgs)
+                            orgsLogins.Add(org.Login);
                     }
                 }
             }
@@ -121,7 +128,7 @@ namespace MigrateToCodeberg
 
             var orgsList = uniqueOwners.Where(o => orgsLogins.Contains(o)).ToList();
             var othersList = uniqueOwners.Where(o => !orgsLogins.Contains(o)).ToList();
-            
+
             potentialOwners.AddRange(orgsList);
             potentialOwners.AddRange(othersList);
 
@@ -155,15 +162,26 @@ namespace MigrateToCodeberg
             string includeForksInput = Console.ReadLine();
             bool includeForks = includeForksInput?.Trim().ToLower() == "y";
 
-            Console.Write("    Enable Push Mirroring back to GitHub? (y/n, default n): ");
-            bool enablePushMirror = Console.ReadLine()?.Trim().ToLower() == "y";
+            bool enablePushMirror = false;
             string pushMirrorInterval = "8h0m0s";
-            if (enablePushMirror)
+            if (!removeMirrorsOnly)
             {
-                Console.Write("    Push mirror interval (e.g. 8h0m0s, default 8h0m0s): ");
-                var intervalInput = Console.ReadLine()?.Trim().ToLower();
-                if (!string.IsNullOrWhiteSpace(intervalInput) && intervalInput != "y") 
-                    pushMirrorInterval = intervalInput;
+                Console.Write("    Enable Push Mirroring back to GitHub? (y/n, default n): ");
+                enablePushMirror = Console.ReadLine()?.Trim().ToLower() == "y";
+                if (enablePushMirror)
+                {
+                    Console.Write("    Push mirror interval (e.g. 8h0m0s, default 8h0m0s): ");
+                    var intervalInput = Console.ReadLine()?.Trim().ToLower();
+                    if (!string.IsNullOrWhiteSpace(intervalInput) && intervalInput != "y")
+                        pushMirrorInterval = intervalInput;
+                }
+            }
+
+            bool removePushMirrors = removeMirrorsOnly;
+            if (!removeMirrorsOnly)
+            {
+                Console.Write("    Remove all existing push mirror settings from each pushed repository? (y/n, default n): ");
+                removePushMirrors = Console.ReadLine()?.Trim().ToLower() == "y";
             }
 
             Console.Write("    Enter description prefix (e.g. [MIRROR] , leave empty for none): ");
@@ -176,6 +194,8 @@ namespace MigrateToCodeberg
             Console.WriteLine($"    Using description prefix: {(string.IsNullOrEmpty(descriptionPrefix) ? "none" : descriptionPrefix)}");
             Console.WriteLine($"    Include Forks           : {(includeForks ? "Yes" : "No")}");
             Console.WriteLine($"    Push Mirroring          : {(enablePushMirror ? $"Enabled ({pushMirrorInterval})" : "Disabled")}");
+            Console.WriteLine($"    Remove Existing Mirrors : {(removePushMirrors ? "Yes" : "No")}");
+            Console.WriteLine($"    Mode                    : {(removeMirrorsOnly ? "Remove mirrors only" : "Migrate repositories")}");
 
             if (ownerMapping.Count == 0)
             {
@@ -208,8 +228,15 @@ namespace MigrateToCodeberg
 
                 string visibility = repo.Private ? "private" : "public";
                 string forkStatus = repo.Fork ? "fork" : "source";
-                
+
                 string targetOwner = ownerMapping[repo.Owner.Login];
+
+                if (removeMirrorsOnly)
+                {
+                    Console.Write($">>> Cleaning mirrors: {targetOwner}/{repo.Name}...");
+                    await RemovePushMirrorsAsync(httpClient, targetOwner, repo.Name, codebergAuth);
+                    continue;
+                }
 
                 Console.Write($">>> Processing: {repo.Name} ({visibility}, {forkStatus}) -> {targetOwner}...");
 
@@ -224,7 +251,7 @@ namespace MigrateToCodeberg
                     repo_name = repo.Name,
                     repo_owner = targetOwner,
                     service = "github",
-                    description = description
+                    description = description,
                 };
 
                 var jsonPayload = JsonSerializer.Serialize(payload);
@@ -270,6 +297,11 @@ namespace MigrateToCodeberg
                         }
                     }
 
+                    if (shouldSetupMirror && removePushMirrors)
+                    {
+                        await RemovePushMirrorsAsync(httpClient, targetOwner, repo.Name, codebergAuth);
+                    }
+
                     if (shouldSetupMirror && enablePushMirror)
                     {
                         await SetupPushMirrorAsync(httpClient, targetOwner, repo.Owner.Login, repo.Name, pushMirrorInterval, codebergAuth, config);
@@ -289,15 +321,15 @@ namespace MigrateToCodeberg
         static async Task SetupPushMirrorAsync(HttpClient client, string targetOwner, string githubOwner, string repoName, string interval, AuthenticationHeaderValue auth, Config config)
         {
             Console.Write($"    -> Setting up push mirror back to GitHub...");
-            
+
             var url = $"https://codeberg.org/api/v1/repos/{targetOwner}/{repoName}/push_mirrors";
-            
+
             var payload = new
             {
                 remote_address = $"https://github.com/{githubOwner}/{repoName}.git",
                 remote_username = config.GithubUsername,
                 remote_password = config.GithubToken,
-                interval = interval
+                interval = interval,
             };
 
             var request = new HttpRequestMessage(HttpMethod.Post, url);
@@ -322,15 +354,73 @@ namespace MigrateToCodeberg
             }
         }
 
+        static async Task RemovePushMirrorsAsync(HttpClient client, string owner, string repoName, AuthenticationHeaderValue auth)
+        {
+            Console.Write("    -> Removing existing push mirrors...");
+            var url = $"https://codeberg.org/api/v1/repos/{owner}/{repoName}/push_mirrors";
+
+            try
+            {
+                using var getRequest = new HttpRequestMessage(HttpMethod.Get, url);
+                getRequest.Headers.Authorization = auth;
+                using var getResponse = await client.SendAsync(getRequest);
+                if (!getResponse.IsSuccessStatusCode)
+                {
+                    if (getResponse.StatusCode == System.Net.HttpStatusCode.NotFound)
+                        Console.WriteLine(" Repository not found under this Codeberg owner (check the target owner mapping).");
+                    else
+                        Console.WriteLine($" Failed to list mirrors (HTTP {(int)getResponse.StatusCode})");
+                    return;
+                }
+
+                using var mirrorsDoc = JsonDocument.Parse(await getResponse.Content.ReadAsStringAsync());
+                var mirrors = mirrorsDoc.RootElement;
+                if (mirrors.ValueKind != JsonValueKind.Array || mirrors.GetArrayLength() == 0)
+                {
+                    Console.WriteLine(" None found.");
+                    return;
+                }
+
+                int removed = 0;
+                foreach (var mirror in mirrors.EnumerateArray())
+                {
+                    if (!mirror.TryGetProperty("remote_name", out var remoteName) || string.IsNullOrWhiteSpace(remoteName.GetString()))
+                    {
+                        Console.WriteLine(" Could not remove a mirror because its remote name was missing from the API response.");
+                        continue;
+                    }
+
+                    var encodedRemoteName = Uri.EscapeDataString(remoteName.GetString()!);
+                    using var deleteRequest = new HttpRequestMessage(HttpMethod.Delete, $"{url}/{encodedRemoteName}");
+                    deleteRequest.Headers.Authorization = auth;
+                    using var deleteResponse = await client.SendAsync(deleteRequest);
+                    if (deleteResponse.IsSuccessStatusCode)
+                        removed++;
+                    else
+                        Console.WriteLine($" Failed to remove mirror '{remoteName.GetString()}' (HTTP {(int)deleteResponse.StatusCode}).");
+                }
+
+                Console.WriteLine($" Removed {removed} of {mirrors.GetArrayLength()} mirror(s).");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($" Error: {ex.Message}");
+            }
+        }
+
         private static Config LoadConfig()
         {
-            if (!System.IO.File.Exists(CONFIG_FILE)) return null;
+            if (!System.IO.File.Exists(CONFIG_FILE))
+                return null;
             try
             {
                 var json = System.IO.File.ReadAllText(CONFIG_FILE);
                 return JsonSerializer.Deserialize<Config>(json);
             }
-            catch { return null; }
+            catch
+            {
+                return null;
+            }
         }
 
         private static void SaveConfig(Config config)
@@ -341,7 +431,10 @@ namespace MigrateToCodeberg
                 System.IO.File.WriteAllText(CONFIG_FILE, json);
                 Console.WriteLine($"    Credentials saved to {CONFIG_FILE}");
             }
-            catch (Exception ex) { Console.WriteLine($"    [WARNING] Could not save config: {ex.Message}"); }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"    [WARNING] Could not save config: {ex.Message}");
+            }
         }
 
         private static Config PromptForConfig()
@@ -361,7 +454,7 @@ namespace MigrateToCodeberg
                 GithubUsername = ghUser?.Trim(),
                 GithubToken = ghToken?.Trim(),
                 CodebergUsername = cbUser?.Trim(),
-                CodebergToken = cbToken?.Trim()
+                CodebergToken = cbToken?.Trim(),
             };
         }
     }
